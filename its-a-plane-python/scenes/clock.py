@@ -3,6 +3,7 @@ from utilities.temperature import grab_forecast
 from utilities.animator import Animator
 from setup import colours, fonts, frames
 from rgbmatrix import graphics
+import time as time_module  # avoid conflict if 'time' is already used
 import logging
 
 
