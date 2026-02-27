@@ -21,6 +21,7 @@ from config import CLOCK_FORMAT
 class ClockScene(object):
     def __init__(self):
         super().__init__()
+        self._last_logo_check = 0  # NEW: track when we last showed the logo
         self._last_time = None
         self.today_sunrise = None
         self.today_sunset = None
@@ -51,6 +52,18 @@ class ClockScene(object):
         return self.today_sunrise, self.today_sunset
 
     @Animator.KeyFrame.add(frames.PER_SECOND * 1)
+    def draw(self):
+    # ── Delta Logo Cycling (NEW) ─────────────────────────────
+    # Check if the display wants to show the Delta logo
+    # This only triggers every DELTA_LOGO_INTERVAL seconds
+    if hasattr(self.display, 'should_show_logo') and self.display.should_show_logo():
+        self.display.show_delta_logo()
+        # show_delta_logo() blocks for DELTA_LOGO_DURATION seconds,
+        # then returns so the clock redraws normally
+        return  # Skip this frame's clock draw, it will draw next cycle
+    # ─────────────────────────────────────────────────────────
+
+    # ... rest of existing clock drawing code below ...
     def clock(self, count):
         if len(self._data):
             # Ensure redraw when there's new data
