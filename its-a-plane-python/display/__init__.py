@@ -1,195 +1,266 @@
+#!/usr/bin/env python3
+# =============================================================================
+# display/__init__.py — RGB Matrix Display Driver
+# Revised for: 128x64 panel support, Delta logo cycling, auto-shutdown
+# =============================================================================
+
 import sys
+import os
+import time
+import threading
 from datetime import datetime
-from setup import frames
-from utilities.animator import Animator
-from utilities.overhead import Overhead
 
-from scenes.temperature import TemperatureScene
-from scenes.flightdetails import FlightDetailsScene
-from scenes.flightlogo import FlightLogoScene
-from scenes.journey import JourneyScene
-from scenes.loadingpulse import LoadingPulseScene
-from scenes.clock import ClockScene
-from scenes.planedetails import PlaneDetailsScene
-from scenes.daysforecast import DaysForecastScene
-from scenes.date import DateScene
+# Add the parent directory to the path so we can import config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rgbmatrix import graphics
-from rgbmatrix import RGBMatrix, RGBMatrixOptions
-
-
-def flight_updated(flights_a, flights_b):
-    get_callsigns = lambda flights: [(f["callsign"], f["direction"]) for f in flights]
-    updatable_a = set(get_callsigns(flights_a))
-    updatable_b = set(get_callsigns(flights_b))
-
-    return updatable_a == updatable_b
-
+from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
+from PIL import Image
 
 try:
-    # Attempt to load config data
     from config import (
-        BRIGHTNESS,
-        GPIO_SLOWDOWN,
-        HAT_PWM_ENABLED,
-        BRIGHTNESS_NIGHT,
-        NIGHT_START,
-        NIGHT_END,
-        NIGHT_BRIGHTNESS,
+        BRIGHTNESS, GPIO_SLOWDOWN, HAT_PWM_ENABLED,
+        LED_ROWS, LED_COLS, LED_CHAIN, LED_PARALLEL,
+        LED_ROW_ADDR_TYPE, LED_MULTIPLEXING, LED_RGB_SEQUENCE,
+        DIM_BRIGHTNESS, DIM_START, DIM_END,
+        DELTA_LOGO_ENABLED, DELTA_LOGO_PATH,
+        DELTA_LOGO_INTERVAL, DELTA_LOGO_DURATION,
+        AUTO_SHUTDOWN_ENABLED, AUTO_SHUTDOWN_TIME,
     )
-    # Parse NIGHT_START and NIGHT_END from strings to datetime objects
-    NIGHT_START = datetime.strptime(NIGHT_START, "%H:%M")
-    NIGHT_END = datetime.strptime(NIGHT_END, "%H:%M")
+except ImportError:
+    # Defaults if config values are missing
+    BRIGHTNESS = 50
+    GPIO_SLOWDOWN = 4
+    HAT_PWM_ENABLED = False
+    LED_ROWS = 64
+    LED_COLS = 128
+    LED_CHAIN = 1
+    LED_PARALLEL = 1
+    LED_ROW_ADDR_TYPE = 0
+    LED_MULTIPLEXING = 0
+    LED_RGB_SEQUENCE = "RGB"
+    DIM_BRIGHTNESS = 15
+    DIM_START = 22
+    DIM_END = 7
+    DELTA_LOGO_ENABLED = False
+    DELTA_LOGO_PATH = "images/delta_logo.ppm"
+    DELTA_LOGO_INTERVAL = 30
+    DELTA_LOGO_DURATION = 5
+    AUTO_SHUTDOWN_ENABLED = False
+    AUTO_SHUTDOWN_TIME = "23:30"
 
-except (ModuleNotFoundError, NameError):
-    # If there's no config data
-    BRIGHTNESS = 100
-    GPIO_SLOWDOWN = 1
-    HAT_PWM_ENABLED = True
-    NIGHT_BRIGHTNESS = False
 
-def adjust_brightness(matrix):
-    if NIGHT_BRIGHTNESS is False:
-        return  # Do nothing if NIGHT_BRIGHTNESS is False
-        
-    # Redraw screen every frame
-    now = datetime.now().time().replace(second=0, microsecond=0)  # Extract only hours and minutes
-    night_start_time = NIGHT_START.time().replace(second=0, microsecond=0)
-    night_end_time = NIGHT_END.time().replace(second=0, microsecond=0)
+class Display:
+    """
+    Manages the RGB LED matrix hardware.
+    Handles initialization, brightness dimming, Delta logo cycling,
+    and auto-shutdown scheduling.
+    """
 
-    # Check if current time is after NIGHT_END and before NIGHT_START
-    if night_end_time <= now < night_start_time:
-        new_brightness = BRIGHTNESS
-    else:
-        new_brightness = BRIGHTNESS_NIGHT
-        
-    # Check if the brightness has changed
-    if matrix.brightness != new_brightness:
-        # Update the brightness
-        matrix.brightness = new_brightness
-        
-class Display(
-    TemperatureScene,
-    FlightDetailsScene,
-    FlightLogoScene,
-    JourneyScene,
-    LoadingPulseScene,
-    PlaneDetailsScene,
-    ClockScene,
-    DaysForecastScene,
-    DateScene,
-    Animator,
-):
     def __init__(self):
-        # Setup Display
+        # ── Matrix Hardware Options ──────────────────────────────────────
         options = RGBMatrixOptions()
-        options.hardware_mapping = "adafruit-hat-pwm" if HAT_PWM_ENABLED else "adafruit-hat"
-        options.rows = 32
-        options.cols = 64
-        options.chain_length = 1
-        options.parallel = 1
-        options.row_address_type = 0
-        options.multiplexing = 0
-        options.pwm_bits = 11
+        options.rows = LED_ROWS
+        options.cols = LED_COLS
+        options.chain_length = LED_CHAIN
+        options.parallel = LED_PARALLEL
+        options.row_address_type = LED_ROW_ADDR_TYPE
+        options.multiplexing = LED_MULTIPLEXING
         options.brightness = BRIGHTNESS
-        options.pwm_lsb_nanoseconds = 130
-        options.led_rgb_sequence = "RGB"
-        options.pixel_mapper_config = ""
-        options.show_refresh_rate = 0
         options.gpio_slowdown = GPIO_SLOWDOWN
-        options.disable_hardware_pulsing = True
-        options.drop_privileges = True
+        options.led_rgb_sequence = LED_RGB_SEQUENCE
+        options.drop_privileges = False
+        options.limit_refresh_rate_hz = 120
+
+        if HAT_PWM_ENABLED:
+            options.hardware_mapping = 'adafruit-hat-pwm'
+        else:
+            options.hardware_mapping = 'adafruit-hat'
+
         self.matrix = RGBMatrix(options=options)
+        self.offscreen_canvas = self.matrix.CreateFrameCanvas()
 
-        # Setup canvas
-        self.canvas = self.matrix.CreateFrameCanvas()
-        self.canvas.Clear()
+        # ── Display Properties ───────────────────────────────────────────
+        self.width = LED_COLS * LED_CHAIN
+        self.height = LED_ROWS
+        self.brightness = BRIGHTNESS
 
-        # Data to render
-        self._data_index = 0
-        self._data = []
+        # ── Delta Logo State ─────────────────────────────────────────────
+        self.delta_logo_image = None
+        self.showing_logo = False
+        self._last_logo_time = 0
+        self._logo_thread = None
 
-        # Start Looking for planes
-        self.overhead = Overhead()
-        self.overhead.grab_data()
+        if DELTA_LOGO_ENABLED:
+            self._load_delta_logo()
 
-        # Initalise animator and scenes
-        super().__init__()
+        # ── Auto-Shutdown Thread ─────────────────────────────────────────
+        if AUTO_SHUTDOWN_ENABLED:
+            self._start_shutdown_scheduler()
 
-        # Overwrite any default settings from
-        # Animator or Scenes
-        self.delay = frames.PERIOD
+    # ── Matrix Access ────────────────────────────────────────────────────
+    def swap_frame(self):
+        """Swap the offscreen canvas to the display."""
+        self.offscreen_canvas = self.matrix.SwapOnVSync(self.offscreen_canvas)
 
-    def draw_square(self, x0, y0, x1, y1, colour):
-        for x in range(x0, x1):
-            _ = graphics.DrawLine(self.canvas, x, y0, x, y1, colour)
-            
+    def clear(self):
+        """Clear the offscreen canvas."""
+        self.offscreen_canvas.Clear()
 
-    @Animator.KeyFrame.add(0)
-    def clear_screen(self):
-        # First operation after
-        # a screen reset
-        self.canvas.Clear()
+    def set_pixel(self, x, y, r, g, b):
+        """Set a single pixel on the offscreen canvas."""
+        self.offscreen_canvas.SetPixel(x, y, r, g, b)
 
-    @Animator.KeyFrame.add(frames.PER_SECOND * 5)
-    def check_for_loaded_data(self, count):
-        if self.overhead.new_data:
-            # Check if there's data
-            there_is_data = len(self._data) > 0 or not self.overhead.data_is_empty
+    def set_image(self, image, x_offset=0, y_offset=0, unsafe=False):
+        """
+        Set an image on the offscreen canvas.
+        Image should be a PIL Image object.
+        """
+        if unsafe:
+            self.offscreen_canvas.SetImage(image, x_offset, y_offset, unsafe)
+        else:
+            self.offscreen_canvas.SetImage(image, x_offset, y_offset)
 
-            # this marks self.overhead.data as no longer new
-            new_data = self.overhead.data
+    def draw_text(self, font, x, y, color, text):
+        """Draw text on the offscreen canvas."""
+        return graphics.DrawText(self.offscreen_canvas, font, x, y, color, text)
 
-            # See if this matches the data already on the screen
-            # This test only checks if it's 2 lists with the same
-            # callsigns, regardless or order
-            data_is_different = not flight_updated(self._data, new_data)
+    def draw_line(self, x0, y0, x1, y1, color):
+        """Draw a line on the offscreen canvas."""
+        graphics.DrawLine(self.offscreen_canvas, x0, y0, x1, y1, color)
 
-            if data_is_different:
-                self._data_index = 0
-                self._data_all_looped = False
-                self._data = new_data
+    # ── Brightness & Dimming ─────────────────────────────────────────────
+    def update_brightness(self):
+        """Adjust brightness based on time of day (dim schedule)."""
+        hour = datetime.now().hour
+        if DIM_START > DIM_END:
+            # Overnight dimming (e.g., 22:00 to 07:00)
+            is_dim = hour >= DIM_START or hour < DIM_END
+        else:
+            is_dim = DIM_START <= hour < DIM_END
 
-            # Only reset if there's flight data already
-            # on the screen, of if there's some new
-            # data available to draw which is different
-            # from the current data
-            reset_required = there_is_data and data_is_different
+        target = DIM_BRIGHTNESS if is_dim else BRIGHTNESS
+        if self.matrix.brightness != target:
+            self.matrix.brightness = target
 
-            if reset_required:
-                self.reset_scene()
+    # ── Delta Logo ───────────────────────────────────────────────────────
+    def _load_delta_logo(self):
+        """Load the Delta logo image, scaling it to fit the panel."""
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        logo_path = os.path.join(script_dir, DELTA_LOGO_PATH)
 
-    @Animator.KeyFrame.add(1)
-    def sync(self, count):
-        # Redraw screen every frame
-        _ = self.matrix.SwapOnVSync(self.canvas)
-        
-    
-        # Adjust brightness
-        adjust_brightness(self.matrix)
+        if not os.path.exists(logo_path):
+            print(f"[WARNING] Delta logo not found at {logo_path}")
+            print("          Delta logo cycling is disabled.")
+            return
 
-    @Animator.KeyFrame.add(frames.PER_SECOND * 30)
-    def grab_new_data(self, count):
-        # Only grab data if we're not already searching
-        # for planes, or if there's new data available
-        # which hasn't been displayed.
-        #
-        # We also need wait until all previously grabbed
-        # data has been looped through the display.
-        #
-        # Last, if our internal store of the data
-        # is empty, try and grab data
-        if not (self.overhead.processing and self.overhead.new_data) and (
-            self._data_all_looped or len(self._data) <= 1
-        ):
-            self.overhead.grab_data()
-
-    def run(self):
         try:
-            # Start loop
-            print("Press CTRL-C to stop")
+            img = Image.open(logo_path).convert("RGB")
+            # Scale to fit the panel while maintaining aspect ratio
+            img_ratio = img.width / img.height
+            panel_ratio = self.width / self.height
+
+            if img_ratio > panel_ratio:
+                # Image is wider — fit to width
+                new_width = self.width
+                new_height = int(self.width / img_ratio)
+            else:
+                # Image is taller — fit to height
+                new_height = self.height
+                new_width = int(self.height * img_ratio)
+
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+
+            # Center on a black background
+            background = Image.new("RGB", (self.width, self.height), (0, 0, 0))
+            x_off = (self.width - new_width) // 2
+            y_off = (self.height - new_height) // 2
+            background.paste(img, (x_off, y_off))
+
+            self.delta_logo_image = background
+            print(f"[INFO] Delta logo loaded: {new_width}x{new_height}, "
+                  f"centered on {self.width}x{self.height} canvas")
+        except Exception as e:
+            print(f"[ERROR] Failed to load Delta logo: {e}")
+            self.delta_logo_image = None
+
+    def should_show_logo(self):
+        """
+        Check if it's time to show the Delta logo.
+        Returns True if DELTA_LOGO_INTERVAL seconds have passed since last show.
+        Only triggers during weather/clock display (not during flight tracking).
+        """
+        if not DELTA_LOGO_ENABLED or self.delta_logo_image is None:
+            return False
+
+        now = time.time()
+        if now - self._last_logo_time >= DELTA_LOGO_INTERVAL:
+            return True
+        return False
+
+    def show_delta_logo(self):
+        """
+        Display the Delta logo for DELTA_LOGO_DURATION seconds.
+        Call this from the main loop when should_show_logo() returns True.
+        """
+        if self.delta_logo_image is None:
+            return
+
+        self.showing_logo = True
+        self._last_logo_time = time.time()
+
+        # Display the logo
+        self.clear()
+        self.set_image(self.delta_logo_image)
+        self.swap_frame()
+
+        # Hold for the configured duration
+        time.sleep(DELTA_LOGO_DURATION)
+        self.showing_logo = False
+
+    # ── Auto-Shutdown ────────────────────────────────────────────────────
+    def _start_shutdown_scheduler(self):
+        """Start a background thread that checks for the shutdown time."""
+        self._shutdown_thread = threading.Thread(
+            target=self._shutdown_loop,
+            daemon=True
+        )
+        self._shutdown_thread.start()
+        print(f"[INFO] Auto-shutdown scheduled for {AUTO_SHUTDOWN_TIME}")
+
+    def _shutdown_loop(self):
+        """Background loop that initiates shutdown at the configured time."""
+        try:
+            shutdown_hour, shutdown_minute = map(int, AUTO_SHUTDOWN_TIME.split(":"))
+        except ValueError:
+            print(f"[ERROR] Invalid AUTO_SHUTDOWN_TIME: {AUTO_SHUTDOWN_TIME}")
+            return
+
+        shutdown_triggered = False
+
+        while True:
+            now = datetime.now()
+            if (now.hour == shutdown_hour and
+                now.minute == shutdown_minute and
+                not shutdown_triggered):
+
+                print(f"[INFO] Auto-shutdown triggered at {now.strftime('%H:%M')}")
+                # Clear the display before shutdown
+                self.clear()
+                self.swap_frame()
+                time.sleep(2)
+
+                # Initiate system shutdown
+                os.system("sudo shutdown -h now")
+                shutdown_triggered = True
+
+            # Reset the trigger flag after the minute passes
+            if now.minute != shutdown_minute:
+                shutdown_triggered = False
+
+            time.sleep(30)  # Check every 30 seconds
             self.play()
 
         except KeyboardInterrupt:
             print("Exiting\n")
             sys.exit(0)
+
